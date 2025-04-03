@@ -75,7 +75,7 @@ class DataProcessor:
     def remove_flagged_duplicates(df: pd.DataFrame) -> pd.DataFrame:
         """Removes duplicate entries based on 'company' flag."""
         if "company" in df.columns:
-            return df.loc[df["company"].astype(str).str.startswith("Duplicate of")== False].copy()
+            return df.loc[~df["company"].astype(str).str.startswith("Duplicate of")].copy()
         return df
 
     @staticmethod
@@ -173,36 +173,42 @@ class TwitterBot:
 
 def run_pipeline() -> None:
     """Main execution pipeline that integrates all steps."""
-    # Initialize API clients
-    supabase_client = APIClientFactory.create_supabase_client()
-    openai_client = APIClientFactory.create_openai_client()
-    twitter_client = APIClientFactory.create_twitter_client()
+    try:
+        # Capture start_time FIRST in IST
+        ist = pytz.timezone('Asia/Kolkata')
+        start_time = datetime.now(ist)
+        
+        # Initialize API clients
+        supabase_client = APIClientFactory.create_supabase_client()
+        openai_client = APIClientFactory.create_openai_client()
+        twitter_client = APIClientFactory.create_twitter_client()
 
-    # Initialize processing modules
-    data_processor = DataProcessor(supabase_client)
-    llm_analyzer = LLMAnalyzer(openai_client)
-    twitter_bot = TwitterBot()
+        # Initialize processing modules
+        data_processor = DataProcessor(supabase_client)
+        llm_analyzer = LLMAnalyzer(openai_client)
+        twitter_bot = TwitterBot()
 
-    # Step 1: Fetch and preprocess data
-    df = data_processor.fetch_supabase_data("articles_rows_calquity")
-    df = data_processor.preprocess_data(df)
+        # Step 1: Fetch and preprocess data
+        df = data_processor.fetch_supabase_data("articles_rows_calquity")
+        df = data_processor.preprocess_data(df)
 
-    # Step 2: Filter and clean articles
-    ist = pytz.timezone('Asia/Kolkata')
-    start_time = datetime.now(ist)
-    filtered_articles = data_processor.filter_by_time(df, start_time)
-    cleaned_articles = data_processor.remove_flagged_duplicates(filtered_articles)
-    processed_articles = data_processor.handle_missing_values(cleaned_articles)
+        # Step 2: Filter and clean articles
+        filtered_articles = data_processor.filter_by_time(df, start_time)
+        cleaned_articles = data_processor.remove_flagged_duplicates(filtered_articles)
+        processed_articles = data_processor.handle_missing_values(cleaned_articles)
 
-    # Step 3: Analyze articles using LLM
-    processed_articles = llm_analyzer.analyze_articles(processed_articles)
+        # Step 3: Analyze articles using LLM
+        processed_articles = llm_analyzer.analyze_articles(processed_articles)
 
-    # Step 4: Select and post top articles
-    recommended_articles = twitter_bot.recommend_articles(processed_articles)
-    article_list = twitter_bot.convert_to_json_list(recommended_articles)
-    twitter_bot.post_articles_to_twitter(twitter_client, article_list)
+        # Step 4: Select and post top articles
+        recommended_articles = twitter_bot.recommend_articles(processed_articles)
+        article_list = twitter_bot.convert_to_json_list(recommended_articles)
+        twitter_bot.post_articles_to_twitter(twitter_client, article_list)
 
-    logging.info("Pipeline execution completed!")
+        logging.info(f"Pipeline execution completed at {start_time.strftime('%Y-%m-%d %H:%M:%S %Z')}")
+    except Exception as e:
+        logging.error(f"Pipeline failed: {str(e)}")
+        raise
 
 # HTTP Trigger
 @app.route(route="http_trigger")
@@ -215,20 +221,24 @@ def http_trigger(req: func.HttpRequest) -> func.HttpResponse:
         logging.error(f"Error in pipeline execution: {str(e)}")
         return func.HttpResponse(f"Error occurred: {str(e)}", status_code=500)
 
-# Timer Trigger with complex schedule
+# Timer Trigger with conditional execution
 @app.schedule(schedule="0 */10 * * * *", arg_name="mytimer", run_on_startup=False)
 def timer_trigger(mytimer: func.TimerRequest) -> None:
     ist = pytz.timezone('Asia/Kolkata')
     current_time = datetime.now(ist)
     
-    # Check if within active hours (8:00 AM to 3:40 PM IST)
+    # Active hours: 8:00 AM to 3:40 PM IST
     active_start = current_time.replace(hour=8, minute=0, second=0, microsecond=0)
     active_end = current_time.replace(hour=15, minute=40, second=0, microsecond=0)
     
-    # Check if we should run based on schedule
-    if (active_start <= current_time <= active_end) or \
-       (current_time.minute % 30 == 0 and not (active_start <= current_time <= active_end)):
-        logging.info(f'Executing pipeline at {current_time.strftime("%Y-%m-%d %H:%M:%S %Z")}')
+    # Determine execution frequency
+    if active_start <= current_time <= active_end:
+        # Every 10 minutes during active hours
+        logging.info(f'Executing 10-min interval pipeline at {current_time.strftime("%Y-%m-%d %H:%M:%S %Z")}')
+        run_pipeline()
+    elif current_time.minute % 30 == 0:  # :00 and :30 minutes
+        # Every 30 minutes outside active hours
+        logging.info(f'Executing 30-min interval pipeline at {current_time.strftime("%Y-%m-%d %H:%M:%S %Z")}')
         run_pipeline()
     else:
         logging.info(f'Skipping execution at {current_time.strftime("%Y-%m-%d %H:%M:%S %Z")}')
