@@ -208,15 +208,22 @@ class LLMAnalyzer:
         return df
 
 class TwitterBot:
-    """Handles article selection and posting to Twitter."""
+    """Handles article selection and posting to Twitter with optimal character usage."""
 
     @staticmethod
     def recommend_articles(df: pd.DataFrame, threshold: int = 7) -> pd.DataFrame:
-        """Filters articles based on impact_score threshold."""
+        """Filters articles based on impact_score threshold and quality checks."""
         if df.empty:
             return df
             
-        recommended = df[df["impact_score"] >= threshold]
+        recommended = df[
+            (df["impact_score"] >= threshold) &
+            (~df["company"].isin(["Unknown Company", "None of the Above"])) &
+            (df["summary"].notna()) &
+            (df["summary"] != "Summary not provided") &
+            (df["link"].notna())
+        ].copy()
+        
         logging.info(f"Recommended {len(recommended)}/{len(df)} articles")
         if not recommended.empty:
             logging.info(f"Top recommendations:\n{recommended[['company', 'impact_score']].to_string()}")
@@ -224,43 +231,75 @@ class TwitterBot:
 
     @staticmethod
     def convert_to_json_list(df: pd.DataFrame) -> List[Dict[str, Any]]:
-        """Converts DataFrame to a list of JSON objects."""
-        columns = [col for col in ['company', 'sentiment', 'summary', 'link', 'impact_score'] if col in df.columns]
+        """Converts DataFrame to a list of JSON objects with required fields."""
+        columns = [col for col in ['id', 'company', 'sentiment', 'summary', 'link', 'impact_score'] 
+                  if col in df.columns]
         return df[columns].to_dict(orient="records")
 
     def post_articles_to_twitter(self, twitter_client: tweepy.Client, articles: List[Dict[str, str]]) -> None:
-        """Posts articles to Twitter."""
+        """Posts articles to Twitter with maximum content utilization and rate limit handling."""
         if not articles:
             logging.warning("No articles to post")
             return
             
-        logging.info(f"Posting {len(articles)} articles")
+        logging.info(f"Attempting to post {len(articles)} articles")
+        
+        # Constants
+        TWITTER_URL_LENGTH = 23  # Twitter counts all URLs as 23 chars
+        SENTIMENT_EMOJIS = {
+            "positive": "🟩",
+            "negative": "🟥",
+            "neutral": "🟨",
+            "mixed": "🟨"
+        }
         
         for idx, article in enumerate(articles, 1):
             try:
-                required_fields = ['company', 'sentiment', 'summary', 'link']
-                if not all(article.get(field) for field in required_fields):
-                    logging.error(f"Skipping article {idx}: Missing fields")
+                # Validate required fields
+                if not all(article.get(field) for field in ['id', 'company', 'summary', 'link']):
+                    logging.error(f"Skipping article {idx}: Missing required fields")
                     continue
 
-                base_text = f"""📢 {article['company']}
-                Sentiment: {article['sentiment'].capitalize()}
-                Summary: {article['summary']}
-                Read more: {article['link']}"""
-                
-                tweet_text = ' '.join(base_text.split()).strip()
-                if len(tweet_text) > 280:
-                    tweet_text = tweet_text[:274] + "..."
+                # Prepare components
+                emoji = SENTIMENT_EMOJIS.get(article.get('sentiment', 'neutral').lower(), "➡️")
+                company = str(article['company']).strip()
+                summary = str(article['summary']).strip()
+                link = str(article['link']).strip()
 
-                logging.info(f"Posting ({idx}/{len(articles)}): {tweet_text[:50]}...")
-                response = twitter_client.create_tweet(text=tweet_text)
-                logging.info(f"Posted tweet ID: {response.data['id']}")
-                time.sleep(10)
+                # Calculate available space (280 - fixed elements - URL)
+                base_elements = f"{emoji} {company}: \n"  # Emoji, space, company, colon, newline
+                available_chars = 280 - len(base_elements) - TWITTER_URL_LENGTH
+
+                # Smart truncation
+                if len(summary) > available_chars:
+                    truncated = summary[:available_chars-3]  # Reserve 3 chars for ellipsis
+                    if ' ' in truncated:  # Don't cut mid-word if possible
+                        truncated = truncated.rsplit(' ', 1)[0]
+                    summary = truncated + "..."
                 
-            except tweepy.TweepyException as e:
-                logging.error(f"Twitter error: {str(e)}")
+                # Compose tweet
+                tweet_text = f"{base_elements}\n{summary}\n{link}"
+                tweet_length = len(tweet_text) - (len(link) - TWITTER_URL_LENGTH)  # Adjust for URL
+                
+                logging.info(f"Posting article {article['id']} ({tweet_length}/280 chars)")
+                logging.debug(f"Content preview: {tweet_text[:60]}...")
+
+                # Post with rate limit handling
+                try:
+                    response = twitter_client.create_tweet(text=tweet_text)
+                    logging.info(f"Successfully posted tweet ID: {response.data['id']}")
+                    time.sleep(25)  # Conservative delay between tweets
+                except tweepy.TweepyException as e:
+                    if "429" in str(e):
+                        wait_time = 50  # 50 seconds for rate limiting
+                        logging.warning(f"Rate limit hit. Waiting {wait_time} seconds...")
+                        time.sleep(wait_time)
+                        continue  # Retry this tweet after waiting
+                    raise
+                    
             except Exception as e:
-                logging.error(f"Unexpected error: {str(e)}")
+                logging.error(f"Failed to post article {article.get('id', 'unknown')}: {str(e)}")
+                continue
 
 def run_pipeline(last_trigger_time: Optional[datetime]) -> datetime:
     """Main execution pipeline with dynamic window."""
